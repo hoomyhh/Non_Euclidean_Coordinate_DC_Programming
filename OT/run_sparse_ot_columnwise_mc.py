@@ -22,14 +22,9 @@ import numpy as np
 import pandas as pd
 
 
-DEFAULT_NOTEBOOK = Path(
-    "/Users/hooma555/Desktop/Post_Doc/Papers/BCDC_Non_Euclid/OT/"
-    "sparse-ot/sparse_ot_bcdc_columnwise_entropy_smoothness.ipynb"
-)
-DEFAULT_OUTPUT_DIR = Path(
-    "/Users/hooma555/Documents/Codex/2026-08-10/de/outputs/"
-    "sparse_ot_columnwise_mc10"
-)
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_NOTEBOOK = SCRIPT_DIR / "sparse_ot_bcdc_columnwise_entropy_smoothness.ipynb"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "outputs" / "sparse_ot_columnwise_mc10"
 DEFINITION_CELLS = (2, 4, 6, 8, 10)
 METRIC_COLUMNS = (
     "objective",
