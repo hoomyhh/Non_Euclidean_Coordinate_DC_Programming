@@ -604,9 +604,11 @@ def solve_selected_coordinate_subproblem_inner_loop(
     selected_v,
     config,
     precomputed_candidate=None,
+    max_inner=None,
 ):
     """Repeatedly solve the selected column's entropy-BCDC candidate, up to
-    config.max_inner_iterations times, re-linearizing the smooth gradient
+    max_inner times (defaults to config.max_inner_iterations, i.e. the flat
+    schedule, when not given explicitly), re-linearizing the smooth gradient
     around the current (updated) column value at every inner step, while
     holding the DC subgradient anchor `selected_v` fixed (it is only
     refreshed at the next outer DCA iteration, matching the frozen-subproblem
@@ -616,8 +618,17 @@ def solve_selected_coordinate_subproblem_inner_loop(
     matrix), so it stays as cheap as the existing single-shot update per
     inner step.
 
+    Passing an explicit `max_inner` (e.g. from a per-outer-step schedule such
+    as t_k=k, see solve_bcdc's `inner_iterations_schedule`) overrides
+    config.max_inner_iterations just for this call, without needing a
+    modified config object per outer step.
+
     Returns (final_plan_column, updated_source_marginal, inner_iterations_used, converged).
     """
+    if max_inner is None:
+        max_inner = config.max_inner_iterations
+    max_inner = int(max_inner)
+
     p0 = plan[:, j]
     prev_obj = column_subproblem_objective(
         problem, p0, source_marginal, float(target_marginal[j]), j, selected_v
@@ -631,21 +642,21 @@ def solve_selected_coordinate_subproblem_inner_loop(
         # `precomputed_candidate` (if any) was already produced by the selection
         # phase's own call to evaluate_block -- i.e. it *is* inner step 1, not a
         # new anchor to step from. Count it as such rather than re-solving it,
-        # so max_inner_iterations=1 reduces exactly to the old single-shot path.
+        # so max_inner=1 reduces exactly to the old single-shot path.
         src = src + (precomputed_candidate - plan_col)
         plan_col = precomputed_candidate
         tgt_j = float(plan_col.sum())
         curr_obj = column_subproblem_objective(problem, plan_col, src, tgt_j, j, selected_v)
         obj_change = relative_objective_change(prev_obj, curr_obj)
         prev_obj = curr_obj
-        if obj_change <= config.inner_tol or config.max_inner_iterations <= 1:
+        if obj_change <= config.inner_tol or max_inner <= 1:
             converged = obj_change <= config.inner_tol
             return plan_col, src, 1, converged
         start_inner = 2
 
     tgt_j = float(plan_col.sum())
     inner = start_inner - 1
-    for inner in range(start_inner, int(config.max_inner_iterations) + 1):
+    for inner in range(start_inner, max_inner + 1):
         grad_f = column_gradient_f(problem, src, tgt_j, j)
         d = grad_f + problem.sparsity_weight - selected_v
         L = columnwise_entropy_smoothness(problem, src, plan_col, config)
@@ -1088,14 +1099,31 @@ def next_random_reshuffled_block(rng, state, num_target):
     )
 
 
-def solve_bcdc(problem, config, initial_plan=None, use_inner_iterations=False):
+def solve_bcdc(
+    problem,
+    config,
+    initial_plan=None,
+    use_inner_iterations=False,
+    inner_iterations_schedule=None,
+):
     """use_inner_iterations=False (default) preserves the existing single-shot
     per-column update exactly as before. Set True to instead repeat the
-    Bregman-proximal column update up to config.max_inner_iterations times
-    (stopping early via config.inner_tol), matching how the full-dimensional
-    methods and PIP already solve their frozen DCA subproblem -- i.e. this
-    makes the coordinate method's inner accuracy match the outer accuracy
-    condition of Algorithm 1 more closely, at additional per-block cost."""
+    Bregman-proximal column update at each selected block, stopping early via
+    config.inner_tol, matching how the full-dimensional methods and PIP
+    already solve their frozen DCA subproblem -- i.e. this makes the
+    coordinate method's inner accuracy match the outer accuracy condition of
+    Algorithm 1 more closely, at additional per-block cost.
+
+    By default (inner_iterations_schedule=None) the inner-iteration cap is
+    flat: config.max_inner_iterations at every outer step. Pass a callable
+    `inner_iterations_schedule(k) -> int`, where k is the 1-indexed outer
+    (block-selection) iteration, to instead grow the inner budget with k --
+    e.g. `lambda k: k` instantiates the t_k=k schedule discussed right after
+    Theorem theorem:convergence in the paper (an O(1/t)-rate inner oracle run
+    for t_k=k steps gives eps_k <= C/k, at a cost of sum_k k = O(K^2) total
+    inner iterations -- only tractable for small K). Ignored when
+    use_inner_iterations is False.
+    """
     config.validate(problem.num_target)
     plan = (
         initialize_plan(problem)
@@ -1171,6 +1199,11 @@ def solve_bcdc(problem, config, initial_plan=None, use_inner_iterations=False):
         counters["touched_nonzeros"] += int(selection_touched)
 
         if use_inner_iterations:
+            step_max_inner = (
+                int(inner_iterations_schedule(iteration))
+                if inner_iterations_schedule is not None
+                else None
+            )
             candidate, updated_source_marginal, inner_used, subproblem_converged = (
                 solve_selected_coordinate_subproblem_inner_loop(
                     problem,
@@ -1181,6 +1214,7 @@ def solve_bcdc(problem, config, initial_plan=None, use_inner_iterations=False):
                     selected_v,
                     config,
                     precomputed_candidate=precomputed_candidate,
+                    max_inner=step_max_inner,
                 )
             )
             old = plan[:, j].copy()
