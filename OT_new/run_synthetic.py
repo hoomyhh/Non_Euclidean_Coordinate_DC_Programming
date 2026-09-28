@@ -41,6 +41,15 @@ def configure_experiment(args: argparse.Namespace) -> dict:
     if args.full_inner_iterations is not None:
         inner["full_entropy"] = int(args.full_inner_iterations)
         inner["full_euclidean"] = int(args.full_inner_iterations)
+    if args.coord_inner_iterations is not None:
+        # Opt-in: repeat the per-column Bregman-proximal update up to this many
+        # times (re-linearizing at each inner step), instead of the default
+        # single-shot update, matching how the full-dimensional methods and
+        # PIP already solve their frozen DCA subproblem. Default behavior
+        # (single-shot) is unchanged unless this flag is passed.
+        config["bcdc_use_inner_iterations"] = True
+        for method_key in core.BCDC_COMPARISON_RULES:
+            inner[method_key] = int(args.coord_inner_iterations)
     config["max_inner_iterations_by_method"] = inner
 
     return config
@@ -109,6 +118,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gs-sweeps", type=int)
     parser.add_argument("--full-outer-iterations", type=int)
     parser.add_argument("--full-inner-iterations", type=int)
+    parser.add_argument(
+        "--coord-inner-iterations",
+        type=int,
+        help=(
+            "If set, repeat each selected column's Bregman-proximal update up "
+            "to this many times (re-linearizing each inner step) instead of "
+            "the default single-shot update. Matches PIP's T_in convention."
+        ),
+    )
     parser.add_argument("--include-zero-grid", action="store_true")
     return parser.parse_args(argv)
 

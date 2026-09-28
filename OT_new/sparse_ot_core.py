@@ -563,6 +563,115 @@ def solve_selected_coordinate_subproblem(
     return candidate
 
 
+def column_subproblem_objective(
+    problem, plan_col, source_marginal, target_marginal_j, j, v_j
+):
+    """Frozen (v_j fixed) DCA subproblem objective restricted to column j, used
+    only as a relative-change stopping criterion for repeated inner solves."""
+    r = np.maximum(source_marginal, EPS)
+    sj = max(float(target_marginal_j), EPS)
+    return float(
+        np.dot(problem.cost[:, j], plan_col)
+        + problem.source_kl_weight * generalized_kl(r, problem.source_mass)
+        + problem.target_kl_weight
+        * generalized_kl(np.array([sj]), np.array([problem.target_mass[j]]))
+        + 0.5 * problem.quadratic_weight * float(np.dot(plan_col, plan_col))
+        + problem.sparsity_weight * float(np.sum(plan_col))
+        - float(np.dot(v_j, plan_col))
+    )
+
+
+def column_gradient_f(problem, source_marginal, target_marginal_j, j):
+    """Same as block_gradient_f, but takes the column's scalar target marginal
+    directly instead of indexing a full target_marginal array -- lets the
+    inner loop re-linearize around an updated column without touching the
+    rest of the plan/target_marginal array."""
+    r = np.maximum(source_marginal, EPS)
+    sj = max(float(target_marginal_j), EPS)
+    return (
+        problem.cost[:, j]
+        + problem.source_kl_weight * np.log(r / problem.source_mass)
+        + problem.target_kl_weight * np.log(sj / problem.target_mass[j])
+    )
+
+
+def solve_selected_coordinate_subproblem_inner_loop(
+    problem,
+    plan,
+    source_marginal,
+    target_marginal,
+    j,
+    selected_v,
+    config,
+    precomputed_candidate=None,
+):
+    """Repeatedly solve the selected column's entropy-BCDC candidate, up to
+    config.max_inner_iterations times, re-linearizing the smooth gradient
+    around the current (updated) column value at every inner step, while
+    holding the DC subgradient anchor `selected_v` fixed (it is only
+    refreshed at the next outer DCA iteration, matching the frozen-subproblem
+    convention already used by solve_full_dca / PIP). Mirrors the pattern of
+    the full-dimensional inner loop in solve_full_dca, applied per column.
+    Operates on the column vector directly (never copies the full plan
+    matrix), so it stays as cheap as the existing single-shot update per
+    inner step.
+
+    Returns (final_plan_column, updated_source_marginal, inner_iterations_used, converged).
+    """
+    p0 = plan[:, j]
+    prev_obj = column_subproblem_objective(
+        problem, p0, source_marginal, float(target_marginal[j]), j, selected_v
+    )
+
+    plan_col = p0
+    src = source_marginal
+    start_inner = 1
+    converged = False
+    if precomputed_candidate is not None:
+        # `precomputed_candidate` (if any) was already produced by the selection
+        # phase's own call to evaluate_block -- i.e. it *is* inner step 1, not a
+        # new anchor to step from. Count it as such rather than re-solving it,
+        # so max_inner_iterations=1 reduces exactly to the old single-shot path.
+        src = src + (precomputed_candidate - plan_col)
+        plan_col = precomputed_candidate
+        tgt_j = float(plan_col.sum())
+        curr_obj = column_subproblem_objective(problem, plan_col, src, tgt_j, j, selected_v)
+        obj_change = relative_objective_change(prev_obj, curr_obj)
+        prev_obj = curr_obj
+        if obj_change <= config.inner_tol or config.max_inner_iterations <= 1:
+            converged = obj_change <= config.inner_tol
+            return plan_col, src, 1, converged
+        start_inner = 2
+
+    tgt_j = float(plan_col.sum())
+    inner = start_inner - 1
+    for inner in range(start_inner, int(config.max_inner_iterations) + 1):
+        grad_f = column_gradient_f(problem, src, tgt_j, j)
+        d = grad_f + problem.sparsity_weight - selected_v
+        L = columnwise_entropy_smoothness(problem, src, plan_col, config)
+        candidate = entropy_bcdc_candidate(
+            plan_col,
+            d,
+            L,
+            problem.quadratic_weight,
+            config.min_plan_value,
+            log_radius=config.block_log_radius,
+        )
+
+        src = src + (candidate - plan_col)
+        plan_col = candidate
+        tgt_j = float(plan_col.sum())
+
+        curr_obj = column_subproblem_objective(problem, plan_col, src, tgt_j, j, selected_v)
+        obj_change = relative_objective_change(prev_obj, curr_obj)
+        prev_obj = curr_obj
+        if obj_change <= config.inner_tol:
+            converged = True
+            break
+
+    return plan_col, src, int(inner), converged
+
+
 def choose_block(
     problem,
     plan,
@@ -979,7 +1088,14 @@ def next_random_reshuffled_block(rng, state, num_target):
     )
 
 
-def solve_bcdc(problem, config, initial_plan=None):
+def solve_bcdc(problem, config, initial_plan=None, use_inner_iterations=False):
+    """use_inner_iterations=False (default) preserves the existing single-shot
+    per-column update exactly as before. Set True to instead repeat the
+    Bregman-proximal column update up to config.max_inner_iterations times
+    (stopping early via config.inner_tol), matching how the full-dimensional
+    methods and PIP already solve their frozen DCA subproblem -- i.e. this
+    makes the coordinate method's inner accuracy match the outer accuracy
+    condition of Algorithm 1 more closely, at additional per-block cost."""
     config.validate(problem.num_target)
     plan = (
         initialize_plan(problem)
@@ -996,6 +1112,7 @@ def solve_bcdc(problem, config, initial_plan=None):
     rows = []
     counters = init_counters()
     selected_score = np.nan
+    total_inner_cumulative = 0
     uniform_state = {"order": None, "position": 0}
     candidate_batch_state = {"order": None, "position": 0}
     t0 = time.perf_counter()
@@ -1053,27 +1170,49 @@ def solve_bcdc(problem, config, initial_plan=None):
         counters["column_accesses"] += int(selection_columns)
         counters["touched_nonzeros"] += int(selection_touched)
 
-        candidate = solve_selected_coordinate_subproblem(
-            problem,
-            plan,
-            source_marginal,
-            target_marginal,
-            j,
-            selected_v,
-            config,
-            precomputed_candidate=precomputed_candidate,
-        )
-        old = plan[:, j].copy()
-        delta = candidate - old
-        plan[:, j] = candidate
-        source_marginal += delta
-        target_marginal[j] = float(candidate.sum())
+        if use_inner_iterations:
+            candidate, updated_source_marginal, inner_used, subproblem_converged = (
+                solve_selected_coordinate_subproblem_inner_loop(
+                    problem,
+                    plan,
+                    source_marginal,
+                    target_marginal,
+                    j,
+                    selected_v,
+                    config,
+                    precomputed_candidate=precomputed_candidate,
+                )
+            )
+            old = plan[:, j].copy()
+            plan[:, j] = candidate
+            source_marginal = updated_source_marginal
+            target_marginal[j] = float(candidate.sum())
+            total_inner_cumulative += int(inner_used)
+        else:
+            candidate = solve_selected_coordinate_subproblem(
+                problem,
+                plan,
+                source_marginal,
+                target_marginal,
+                j,
+                selected_v,
+                config,
+                precomputed_candidate=precomputed_candidate,
+            )
+            old = plan[:, j].copy()
+            delta = candidate - old
+            plan[:, j] = candidate
+            source_marginal += delta
+            target_marginal[j] = float(candidate.sum())
+            inner_used = 1
+            total_inner_cumulative += 1
         counters["optimization_time"] += time.perf_counter() - update_start
 
         # Charge the gradient, candidate construction, and incremental marginal
-        # update over the selected dense column.
-        counters["column_accesses"] += 1
-        counters["touched_nonzeros"] += int(3 * problem.num_source)
+        # update over the selected dense column -- once per inner step actually
+        # performed, so repeated inner solves are charged fairly.
+        counters["column_accesses"] += int(inner_used)
+        counters["touched_nonzeros"] += int(3 * problem.num_source * inner_used)
 
         if iteration % record_every == 0 or iteration == total_iterations:
             sweep = iteration / problem.num_target
@@ -1090,7 +1229,7 @@ def solve_bcdc(problem, config, initial_plan=None):
                 selected_score=selected_score,
                 t0=t0,
                 outer_iteration=int(np.ceil(sweep)),
-                inner_iterations=iteration,
+                inner_iterations=total_inner_cumulative,
             )
 
     return plan, pd.DataFrame(rows)

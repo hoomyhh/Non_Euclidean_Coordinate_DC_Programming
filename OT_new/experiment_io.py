@@ -112,7 +112,12 @@ def run_methods(
         )
         solver_config.validate(problem.num_target)
         if method_key in core.BCDC_COMPARISON_RULES:
-            plan, history = core.solve_bcdc(problem, solver_config, initial_plan)
+            plan, history = core.solve_bcdc(
+                problem,
+                solver_config,
+                initial_plan,
+                use_inner_iterations=bool(config.get("bcdc_use_inner_iterations", False)),
+            )
         elif method_key == "full_entropy":
             plan, history = core.solve_full_dca(
                 problem, solver_config, initial_plan, geometry="entropy"
