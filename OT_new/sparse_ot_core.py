@@ -872,7 +872,11 @@ def resolve_method_integer_budgets(overrides, default, name, allowed_methods=Non
 
 
 def build_method_config(
-    base_config, method_key, outer_iterations_by_method, max_inner_iterations_by_method
+    base_config,
+    method_key,
+    outer_iterations_by_method,
+    max_inner_iterations_by_method,
+    inner_tol_by_method=None,
 ):
     if method_key not in COMPARISON_METHODS:
         raise ValueError(f"Unknown comparison method {method_key!r}.")
@@ -881,9 +885,35 @@ def build_method_config(
         num_sweeps=int(outer_iterations_by_method[method_key]),
         max_inner_iterations=int(max_inner_iterations_by_method[method_key]),
     )
+    if inner_tol_by_method is not None:
+        # Per-method inner tolerance override. Without this, every method
+        # shared a single global inner_tol, so tuning it for the coordinate
+        # methods' adaptive stopping (e.g. via --coord-inner-tol) silently
+        # loosened the full-dimensional methods' own inner-loop stopping
+        # check too, cutting their inner solves short and making them look
+        # far cheaper (and less converged) than intended.
+        cfg = replace(cfg, inner_tol=float(inner_tol_by_method[method_key]))
     if method_key in BCDC_COMPARISON_RULES:
         cfg = replace(cfg, selection_rule=method_key)
     return cfg
+
+
+def resolve_method_float_budgets(overrides, default, name, allowed_methods=None):
+    allowed = tuple(COMPARISON_METHODS if allowed_methods is None else allowed_methods)
+    overrides = {} if overrides is None else dict(overrides)
+    unknown = sorted(set(overrides) - set(allowed))
+    if unknown:
+        raise ValueError(
+            f"{name} contains unknown method keys: {unknown}. "
+            f"Allowed keys are {list(allowed)}."
+        )
+    budgets = {}
+    for method_key in allowed:
+        value = float(overrides.get(method_key, default))
+        if value < 0.0:
+            raise ValueError(f"{name}[{method_key!r}] must be nonnegative.")
+        budgets[method_key] = value
+    return budgets
 
 
 def make_method_budget_table(

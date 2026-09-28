@@ -101,6 +101,11 @@ def run_methods(
         default=config["max_inner_iterations"],
         name="max_inner_iterations_by_method",
     )
+    inner_tol_by_method = core.resolve_method_float_budgets(
+        config.get("inner_tol_by_method"),
+        default=config["inner_tol"],
+        name="inner_tol_by_method",
+    )
 
     histories = []
     final_rows = []
@@ -108,7 +113,11 @@ def run_methods(
     for method_key in core.COMPARISON_METHODS:
         method_started = time.perf_counter()
         solver_config = core.build_method_config(
-            base_solver_config, method_key, outer_iterations, inner_iterations
+            base_solver_config,
+            method_key,
+            outer_iterations,
+            inner_iterations,
+            inner_tol_by_method=inner_tol_by_method,
         )
         solver_config.validate(problem.num_target)
         if method_key in core.BCDC_COMPARISON_RULES:

@@ -443,7 +443,16 @@ def configure_experiment(args: argparse.Namespace, feature_dimension: int) -> di
                 "--coord-inner-tol requires --coord-inner-iterations to also "
                 "be set (it is used as the safety cap for adaptive stopping)."
             )
-        config["inner_tol"] = float(args.coord_inner_tol)
+        # Per-method override -- do NOT touch config["inner_tol"] directly,
+        # since that single global value is also read by the full-dimensional
+        # methods' own inner-loop stopping check (build_base_solver_config).
+        # Setting it globally would silently loosen their tolerance too and
+        # cut their inner solves short. Only the coordinate methods get the
+        # adaptive tolerance; full_entropy/full_euclidean keep the default.
+        tol = copy.deepcopy(config.get("inner_tol_by_method") or {})
+        for method_key in core.BCDC_COMPARISON_RULES:
+            tol[method_key] = float(args.coord_inner_tol)
+        config["inner_tol_by_method"] = tol
 
     return config
 
