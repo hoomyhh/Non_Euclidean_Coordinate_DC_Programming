@@ -426,7 +426,24 @@ def configure_experiment(args: argparse.Namespace, feature_dimension: int) -> di
     if args.full_inner_iterations is not None:
         inner["full_entropy"] = int(args.full_inner_iterations)
         inner["full_euclidean"] = int(args.full_inner_iterations)
+    if args.coord_inner_iterations is not None:
+        # Opt-in: repeat the per-column Bregman-proximal update up to this many
+        # times (re-linearizing at each inner step), applied identically to
+        # every coordinate method (uniform/lipschitz/bregman_gap) for a fair
+        # comparison -- never enable this for only one method. Default
+        # behavior (single-shot update) is unchanged unless this flag is set.
+        config["bcdc_use_inner_iterations"] = True
+        for method_key in core.BCDC_COMPARISON_RULES:
+            inner[method_key] = int(args.coord_inner_iterations)
     config["max_inner_iterations_by_method"] = inner
+
+    if args.coord_inner_tol is not None:
+        if args.coord_inner_iterations is None:
+            raise ValueError(
+                "--coord-inner-tol requires --coord-inner-iterations to also "
+                "be set (it is used as the safety cap for adaptive stopping)."
+            )
+        config["inner_tol"] = float(args.coord_inner_tol)
 
     return config
 
@@ -564,6 +581,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gs-sweeps", type=int, default=1579)
     parser.add_argument("--full-outer-iterations", type=int, default=100)
     parser.add_argument("--full-inner-iterations", type=int, default=100)
+    parser.add_argument(
+        "--coord-inner-iterations",
+        type=int,
+        help=(
+            "If set, repeat each selected column's Bregman-proximal update up "
+            "to this many times (re-linearizing each inner step) instead of "
+            "the default single-shot update, for uniform/lipschitz/bregman_gap "
+            "alike. Matches PIP's T_in convention. Acts as a safety cap when "
+            "--coord-inner-tol is also set (adaptive early stopping)."
+        ),
+    )
+    parser.add_argument(
+        "--coord-inner-tol",
+        type=float,
+        help=(
+            "Relative-inner-objective tolerance for adaptive early stopping of "
+            "the coordinate methods' inner loop, checked against the TRUE "
+            "per-column phi_hat (not the relative-smoothness surrogate U). "
+            "Requires --coord-inner-iterations to also be set, which then acts "
+            "as the safety cap rather than a fixed target. Values around 1e-3 "
+            "to 1e-4 were found to be the genuinely adaptive regime on the "
+            "synthetic validation instance; 1e-6/1e-8 saturated the cap on "
+            "every step there. Not set by default (single-shot update)."
+        ),
+    )
     parser.add_argument("--feature-batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
