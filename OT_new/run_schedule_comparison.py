@@ -54,8 +54,10 @@ def run_condition(
     use_inner_iterations: bool,
     max_inner_iterations: int = 1,
     inner_iterations_schedule=None,
+    inner_tol: float = 1e-12,
     record_every_sweeps: int = 1,
     seed: int = 0,
+    inner_usage_log=None,
 ) -> pd.DataFrame:
     config = core.SolverConfig(
         num_sweeps=num_sweeps,
@@ -65,7 +67,7 @@ def run_condition(
         record_every_sweeps=record_every_sweeps,
         sampling="random_reshuffling",
         max_inner_iterations=max_inner_iterations,
-        inner_tol=1e-12,
+        inner_tol=inner_tol,
     )
     t0 = time.perf_counter()
     plan, history = core.solve_bcdc(
@@ -73,6 +75,7 @@ def run_condition(
         config,
         use_inner_iterations=use_inner_iterations,
         inner_iterations_schedule=inner_iterations_schedule,
+        inner_usage_log=inner_usage_log,
     )
     elapsed = time.perf_counter() - t0
     history = history.copy()

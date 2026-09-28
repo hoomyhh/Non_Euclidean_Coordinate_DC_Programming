@@ -1105,6 +1105,7 @@ def solve_bcdc(
     initial_plan=None,
     use_inner_iterations=False,
     inner_iterations_schedule=None,
+    inner_usage_log=None,
 ):
     """use_inner_iterations=False (default) preserves the existing single-shot
     per-column update exactly as before. Set True to instead repeat the
@@ -1123,6 +1124,12 @@ def solve_bcdc(
     for t_k=k steps gives eps_k <= C/k, at a cost of sum_k k = O(K^2) total
     inner iterations -- only tractable for small K). Ignored when
     use_inner_iterations is False.
+
+    If `inner_usage_log` is given a list, the number of inner iterations
+    actually used at each outer (block-selection) step is appended to it
+    in place -- a lightweight way to inspect how many inner steps an
+    adaptive (config.inner_tol-driven) stopping rule ends up taking in
+    practice, without changing the return signature.
     """
     config.validate(problem.num_target)
     plan = (
@@ -1222,6 +1229,8 @@ def solve_bcdc(
             source_marginal = updated_source_marginal
             target_marginal[j] = float(candidate.sum())
             total_inner_cumulative += int(inner_used)
+            if inner_usage_log is not None:
+                inner_usage_log.append(int(inner_used))
         else:
             candidate = solve_selected_coordinate_subproblem(
                 problem,
