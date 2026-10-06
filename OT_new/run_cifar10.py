@@ -508,6 +508,7 @@ def run_one(
         config,
         run_index=run_index,
         final_metrics=metric_function,
+        methods=args.methods,
     )
     return raw, final, instance_metadata(instance, config)
 
@@ -635,6 +636,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Record Gamma_k = n max_j Delta_j / sum_j Delta_j at every history row.",
     )
+    parser.add_argument(
+        "--methods",
+        help=(
+            "Comma-separated subset of methods to run "
+            f"({','.join(core.COMPARISON_METHODS)}); default all. Each run then "
+            "writes one file per method, so methods can run as separate jobs."
+        ),
+    )
+    parser.add_argument(
+        "--skip-aggregate",
+        action="store_true",
+        help="Only write per-run files; aggregate later with --aggregate-only.",
+    )
+    parser.add_argument(
+        "--aggregate-only",
+        action="store_true",
+        help="Aggregate the files already in --output-dir and exit.",
+    )
     parser.add_argument("--feature-batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
@@ -680,6 +699,13 @@ def portable_path(path: Path) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     validate_args(args)
+    if args.aggregate_only:
+        aggregate_and_publish(args)
+        print(f"Aggregated outputs in {args.output_dir}", flush=True)
+        return 0
+    if args.methods is not None:
+        args.methods = tuple(m.strip() for m in args.methods.split(",") if m.strip())
+    suffix = "" if args.methods is None else "__" + "_".join(args.methods)
     feature_data = ensure_feature_cache(args)
     print(
         f"Loaded CIFAR-10 features: train={feature_data.train_features.shape}, "
@@ -728,22 +754,24 @@ def main(argv: list[str] | None = None) -> int:
 
     started = time.perf_counter()
     for run_index in range(args.run_start, args.num_runs):
-        raw_path = args.output_dir / f"raw_histories_run_{run_index:03d}.csv"
-        final_path = args.output_dir / f"final_run_{run_index:03d}.csv"
+        raw_path = args.output_dir / f"raw_histories_run_{run_index:03d}{suffix}.csv"
+        final_path = args.output_dir / f"final_run_{run_index:03d}{suffix}.csv"
         instance_path = args.output_dir / f"instance_run_{run_index:03d}.json"
         print(f"[run {run_index:02d}] starting", flush=True)
         raw, final, run_metadata = run_one(run_index, config, feature_data, args)
         raw.to_csv(raw_path, index=False)
         final.to_csv(final_path, index=False)
         io.write_metadata(instance_path, run_metadata)
-        aggregate_and_publish(args)
+        if not args.skip_aggregate:
+            aggregate_and_publish(args)
         print(
             f"[run {run_index:02d}] saved. Total elapsed "
             f"{(time.perf_counter() - started) / 60.0:.2f} min.",
             flush=True,
         )
 
-    aggregate_and_publish(args)
+    if not args.skip_aggregate:
+        aggregate_and_publish(args)
     print(f"Done. CSV outputs are in {args.output_dir}", flush=True)
     return 0
 

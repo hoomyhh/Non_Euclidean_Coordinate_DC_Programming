@@ -89,8 +89,14 @@ def run_methods(
     config: dict,
     run_index: int,
     final_metrics: Callable[[np.ndarray], dict[str, float]] | None = None,
+    methods: Iterable[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run every comparison method and return history and final data frames."""
+    """Run the comparison methods (all by default) and return history and
+    final data frames."""
+    methods = tuple(core.COMPARISON_METHODS if methods is None else methods)
+    unknown = sorted(set(methods) - set(core.COMPARISON_METHODS))
+    if unknown:
+        raise ValueError(f"Unknown methods {unknown}; allowed {list(core.COMPARISON_METHODS)}.")
 
     initial_plan = core.initialize_plan(problem)
     base_solver_config = build_base_solver_config(config, problem)
@@ -113,7 +119,7 @@ def run_methods(
     histories = []
     final_rows = []
     started = time.perf_counter()
-    for method_key in core.COMPARISON_METHODS:
+    for method_key in methods:
         method_started = time.perf_counter()
         solver_config = core.build_method_config(
             base_solver_config,
@@ -321,6 +327,14 @@ def aggregate_outputs(
 
     raw = pd.concat((pd.read_csv(path) for path in raw_files), ignore_index=True)
     final = pd.concat((pd.read_csv(path) for path in final_files), ignore_index=True)
+    # Runs may be split over several files (one per method), so the best final
+    # objective of each Monte Carlo run is recomputed across all of them.
+    best_final = final.groupby("mc_run")["objective"].min()
+    for frame in (raw, final):
+        frame["run_best_final_objective"] = frame["mc_run"].map(best_final)
+        frame["objective_gap_to_run_best_final"] = np.maximum(
+            frame["objective"] - frame["run_best_final_objective"], 1e-14
+        )
     final_summary = summarize_final(final, metric_columns)
     objective_vs_matvec = average_curve(
         raw,
