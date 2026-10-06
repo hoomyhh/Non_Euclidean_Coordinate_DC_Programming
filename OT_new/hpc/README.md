@@ -1,7 +1,8 @@
 # CIFAR-10 sparse UOT on Arrhenius
 
 Each (configuration, seed, method) is an independent single-core run.
-`ot_node.slurm` runs all lines of a task file side by side on one CPU node and
+`ot_node.slurm` runs all lines of a task file side by side on 72 cores of a
+GPU node (our allocation cannot use the cpu partition; the GPU stays idle) and
 then aggregates each configuration. Configurations are defined in `configs.sh`.
 
 One-time setup (paths as in `ot_node.slurm`):

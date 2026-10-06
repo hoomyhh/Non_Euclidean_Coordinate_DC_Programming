@@ -1,16 +1,19 @@
 #!/bin/bash
 # Runs every line of $OT_TASK_FILE as an independent single-core process on
-# one node, then aggregates each configuration.  Submit from OT_new/:
+# a quarter of a GPU node, then aggregates each configuration.  The code is
+# CPU-only; the GPU is requested only because the allocation
+# (naiss2026-3-305-gpu) cannot use the cpu partition.  Submit from OT_new/:
 #   sbatch hpc/ot_node.slurm
 
 #SBATCH --job-name=ot-certified
 #SBATCH --account=naiss2026-3-305-gpu
-#SBATCH --partition=cpu
+#SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=128
-#SBATCH --mem=256G
-#SBATCH --time=04:00:00
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=72
+#SBATCH --mem=110G
+#SBATCH --time=06:00:00
 #SBATCH --output=hpc_logs/%x_%j.out
 #SBATCH --error=hpc_logs/%x_%j.err
 
@@ -24,7 +27,7 @@ export OT_TASK_FILE="$OT_PROJECT/tasks.txt"
 # One core per process; numpy must not spawn its own threads.
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 
-module load Python/3.13.5-bundle-SciPy-2025.07-mpi4py-4.1.0-gcc-2025b-eb
+module load GPU/Python/3.13.5-bundle-SciPy-2025.07-mpi4py-4.1.0-gcc-2025b-eb
 
 echo "Tasks: $(wc -l < "$OT_TASK_FILE") on ${SLURM_CPUS_PER_TASK} cores ($(hostname))"
 # Keep going if some tasks fail; their logs are in $OT_OUTPUT_ROOT/*/logs.
