@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
-from scipy.special import wrightomega
+from scipy.special import gammaln, wrightomega
 
 EPS = 1e-12
 
@@ -60,7 +60,8 @@ class SolverConfig:
     # subproblem_certificate.
     inner_stopping: str = "relative_change"
     inner_rho: float = 0.1
-    # Record Gamma_k = n max_j Delta_j / sum_j Delta_j at every history row.
+    # Record Gamma_k = n max_j Delta_j / sum_j Delta_j (and its random-batch
+    # counterpart) at every history row.
     log_gamma: bool = False
 
     def validate(self, num_target):
@@ -1218,8 +1219,25 @@ def gap_concentration(problem, plan, source_marginal, target_marginal, config, l
     )
     total = float(np.sum(gaps))
     largest = float(np.max(gaps))
-    gamma_k = problem.num_target * largest / total if total > 0.0 else 1.0
-    return total, largest, float(gamma_k)
+    n = problem.num_target
+    gamma_k = n * largest / total if total > 0.0 else 1.0
+    # The experiments select the best of a random batch of b columns, so the
+    # factor that matters for them is n E[max_{j in batch} Delta_j] / sum_j
+    # Delta_j.  The r-th largest Delta is the batch maximum with probability
+    # C(n - r, b - 1) / C(n, b), computed here in log space.
+    b = min(int(config.candidate_batch_size), n)
+    ranks = np.arange(1, n + 1)
+    log_prob = np.full(n, -np.inf)
+    valid = n - ranks >= b - 1
+    log_prob[valid] = (
+        gammaln(n - ranks[valid] + 1)
+        - gammaln(b)
+        - gammaln(n - ranks[valid] - b + 2)
+        - (gammaln(n + 1) - gammaln(b + 1) - gammaln(n - b + 1))
+    )
+    expected_batch_max = float(np.dot(np.exp(log_prob), np.sort(gaps)[::-1]))
+    gamma_batch = n * expected_batch_max / total if total > 0.0 else 1.0
+    return total, largest, float(gamma_k), float(gamma_batch)
 
 
 def make_history_row(
@@ -1287,12 +1305,13 @@ def make_history_row(
     }
     if config.log_gamma:
         for name, radius in (("local", config.block_log_radius), ("global", np.inf)):
-            total, largest, gamma_k = gap_concentration(
+            total, largest, gamma_k, gamma_batch = gap_concentration(
                 problem, plan, source_marginal, target_marginal, config, radius
             )
             row[f"gap_sum_{name}"] = total
             row[f"gap_max_{name}"] = largest
             row[f"Gamma_{name}"] = gamma_k
+            row[f"Gamma_batch_{name}"] = gamma_batch
     return row
 
 
