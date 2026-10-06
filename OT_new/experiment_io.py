@@ -78,6 +78,9 @@ def build_base_solver_config(config: dict, problem: core.SparseOTProblem):
         sampling="random_reshuffling",
         max_inner_iterations=config["max_inner_iterations"],
         inner_tol=config["inner_tol"],
+        inner_stopping=config.get("inner_stopping", "relative_change"),
+        inner_rho=float(config.get("inner_rho", 0.1)),
+        log_gamma=bool(config.get("log_gamma", False)),
     )
 
 

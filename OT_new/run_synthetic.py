@@ -51,6 +51,9 @@ def configure_experiment(args: argparse.Namespace) -> dict:
         for method_key in core.BCDC_COMPARISON_RULES:
             inner[method_key] = int(args.coord_inner_iterations)
     config["max_inner_iterations_by_method"] = inner
+    config["inner_stopping"] = args.inner_stopping
+    config["inner_rho"] = float(args.inner_rho)
+    config["log_gamma"] = bool(args.log_gamma)
 
     return config
 
@@ -126,6 +129,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "to this many times (re-linearizing each inner step) instead of "
             "the default single-shot update. Matches PIP's T_in convention."
         ),
+    )
+    parser.add_argument(
+        "--inner-stopping",
+        choices=("relative_change", "certificate"),
+        default="relative_change",
+        help=(
+            "Inner-solve stopping rule for every method. 'certificate' stops "
+            "once the strong-convexity certificate of the subproblem "
+            "suboptimality is at most eps_k = rho * max(Delta_k, decrease so "
+            "far), i.e. eqn:epsilon_update is verified; inner caps still apply."
+        ),
+    )
+    parser.add_argument("--inner-rho", type=float, default=0.1)
+    parser.add_argument(
+        "--log-gamma",
+        action="store_true",
+        help="Record Gamma_k = n max_j Delta_j / sum_j Delta_j at every history row.",
     )
     parser.add_argument("--include-zero-grid", action="store_true")
     return parser.parse_args(argv)

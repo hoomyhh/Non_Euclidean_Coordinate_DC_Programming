@@ -53,6 +53,15 @@ class SolverConfig:
     sampling: str = "random_reshuffling"
     max_inner_iterations: int = 50
     inner_tol: float = 1e-12
+    # "relative_change": stop an inner solve when the subproblem objective
+    # changes by at most inner_tol (relative).  "certificate": stop when the
+    # certified bound on the subproblem suboptimality is at most
+    # eps_k = inner_rho * max(Delta_k, decrease so far); see
+    # subproblem_certificate.
+    inner_stopping: str = "relative_change"
+    inner_rho: float = 0.1
+    # Record Gamma_k = n max_j Delta_j / sum_j Delta_j at every history row.
+    log_gamma: bool = False
 
     def validate(self, num_target):
         valid = {"uniform", "gradient", "lipschitz", "bregman_gap"}
@@ -78,6 +87,10 @@ class SolverConfig:
             raise ValueError("max_inner_iterations must be positive.")
         if self.inner_tol < 0.0:
             raise ValueError("inner_tol must be nonnegative.")
+        if self.inner_stopping not in {"relative_change", "certificate"}:
+            raise ValueError("inner_stopping must be 'relative_change' or 'certificate'.")
+        if not 0.0 <= self.inner_rho < 1.0:
+            raise ValueError("inner_rho must be in [0, 1).")
 
 
 CONFIG = {
@@ -121,6 +134,9 @@ CONFIG = {
         "full_euclidean": 100,
     },
     "inner_tol": 1e-9,
+    "inner_stopping": "relative_change",
+    "inner_rho": 0.1,
+    "log_gamma": False,
 }
 
 
@@ -683,6 +699,179 @@ def solve_selected_coordinate_subproblem_inner_loop(
     return plan_col, src, int(inner), converged
 
 
+
+def subproblem_certificate(gradient, z, rest, tau, gamma, bisection_steps=60):
+    """Upper bound on phi_hat(z) - min_{y >= 0} phi_hat(y) at a feasible z.
+
+    phi_hat = H + R with H(y) = tau sum_i KL(rest_i + sum_k y_ik | a_i)
+    + gamma/2 ||y||^2 + (linear terms) and R the target-marginal KL, which is
+    convex.  For the minimizer y*,
+        phi_hat(z) - phi_hat(y*) <= <g, z - y*> - D_H(y*, z) - D_R(y*, z),
+    so dropping D_R >= 0 and maximizing over all y >= 0 bounds the left-hand
+    side; this is the Bregman gap of the subproblem in the geometry of H.
+
+    z has shape (m, k): one column (k = 1, rest = row sums of the other
+    columns) or the full plan (k = n, rest = 0).  Writing the row KL through
+    its conjugate, tau D(s, w) = sup_mu [mu s - tau w (exp(mu/tau) - 1)], gives
+    for every mu the closed-form upper bound
+        U(mu) = max_{y >= 0} [<g, z - y> - gamma/2 ||y - z||^2 - mu^T s(y)]
+                + sum_i tau w_i (exp(mu_i/tau) - 1),
+    with w = s(z); U(mu) is tight at the optimal mu, which bisection finds.
+    Any mu yields a valid bound, so an inexact bisection only loosens it.  For a
+    single column the maximization is separable and has a closed form."""
+    gamma = float(gamma)
+    tau = float(tau)
+    if gamma <= 0.0 or tau < 0.0:
+        raise ValueError("The certificate needs gamma > 0 and tau >= 0.")
+    g = np.asarray(gradient, dtype=np.float64)
+    z = np.asarray(z, dtype=np.float64)
+    if z.ndim == 1:
+        g, z = g[:, None], z[:, None]
+    rest = np.asarray(rest, dtype=np.float64).reshape(-1)
+    w = np.maximum(rest + z.sum(axis=1), EPS)
+
+    if tau > 0.0 and z.shape[1] == 1:
+        # One entry per row: the maximization is separable and solved exactly.
+        # Stationarity tau log(u) + gamma u = tau log(w) + gamma w - g for
+        # u = rest + y, i.e. u = (tau/gamma) omega(t) with the Wright omega.
+        g1, z1 = g[:, 0], z[:, 0]
+        t = np.log(w) + (gamma * w - g1) / tau - np.log(tau / gamma)
+        y = np.maximum((tau / gamma) * np.real(wrightomega(t)) - rest, 0.0)
+        u = np.maximum(rest + y, 1e-300)
+        step = z1 - y
+        bound = (
+            float(np.dot(g1, step))
+            - 0.5 * gamma * float(np.dot(step, step))
+            - tau * float(np.sum(u * np.log(u / w) - u + w))
+        )
+        return float(max(bound, 0.0))
+
+    def row_sums(mu):
+        y = np.maximum(z - (g + mu[:, None]) / gamma, 0.0)
+        return y, rest + y.sum(axis=1)
+
+    if tau > 0.0:
+        def residual(mu):
+            _, total = row_sums(mu)
+            return tau * np.log(np.maximum(total, 1e-300) / w) - mu
+
+        lo = -np.ones_like(w)
+        hi = np.ones_like(w)
+        for _ in range(200):
+            low_bad = residual(lo) < 0.0
+            if not low_bad.any():
+                break
+            lo[low_bad] *= 2.0
+        for _ in range(200):
+            high_bad = residual(hi) > 0.0
+            if not high_bad.any():
+                break
+            hi[high_bad] *= 2.0
+        for _ in range(int(bisection_steps)):
+            mid = 0.5 * (lo + hi)
+            positive = residual(mid) > 0.0
+            lo = np.where(positive, mid, lo)
+            hi = np.where(positive, hi, mid)
+        mu = 0.5 * (lo + hi)
+    else:
+        mu = np.zeros_like(w)
+
+    y, total = row_sums(mu)
+    step = z - y
+    bound = float(np.sum(g * step)) - 0.5 * gamma * float(np.sum(step * step))
+    if tau > 0.0:
+        bound += tau * float(np.sum(w * np.expm1(mu / tau))) - float(np.dot(mu, total))
+    return float(max(bound, 0.0))
+
+
+def entropy_block_gap(d, p, z, L, gamma):
+    """Gap contribution of one column for the Bregman step p -> z (the same
+    expression as the GS score in evaluate_block)."""
+    return max(
+        float(np.dot(d, p - z))
+        + 0.5 * float(gamma) * float(np.dot(p, p) - np.dot(z, z))
+        - float(L) * entropy_kl(z, p),
+        0.0,
+    )
+
+
+def solve_selected_coordinate_subproblem_certified(
+    problem,
+    plan,
+    source_marginal,
+    target_marginal,
+    j,
+    selected_v,
+    config,
+    precomputed_candidate=None,
+    max_inner=None,
+):
+    """Repeat the column's Bregman step until the subproblem is certified to
+    accuracy eps_k, i.e. phi_hat(z) - min phi_hat <= eps_k as in
+    eqn:epsilon_update, with
+
+        eps_k = inner_rho * max(Delta_k, phi_hat(z_0) - phi_hat(z)),
+
+    Delta_k being the selected column's gap contribution (the rule of
+    eq:app-inner-stop in the PIP experiment).  The left-hand side is bounded
+    by subproblem_certificate, so no reference minimizer is needed.  A
+    solve also ends at max_inner steps or when the certificate falls below the
+    floating-point resolution of phi_hat.
+
+    Returns (column, source_marginal, steps, certificate_checks, converged)."""
+    if max_inner is None:
+        max_inner = config.max_inner_iterations
+    max_inner = int(max_inner)
+    gamma = problem.quadratic_weight
+    shift = problem.sparsity_weight - selected_v
+
+    p0 = np.maximum(plan[:, j], config.min_plan_value)
+    obj0 = column_subproblem_objective(
+        problem, p0, source_marginal, float(target_marginal[j]), j, selected_v
+    )
+    d0 = column_gradient_f(problem, source_marginal, float(target_marginal[j]), j) + shift
+    L0 = columnwise_entropy_smoothness(problem, source_marginal, p0, config)
+    if precomputed_candidate is None:
+        z = entropy_bcdc_candidate(
+            p0, d0, L0, gamma, config.min_plan_value, log_radius=config.block_log_radius
+        )
+    else:
+        z = np.asarray(precomputed_candidate, dtype=np.float64)
+    block_gap = entropy_block_gap(d0, p0, z, L0, gamma)
+    src = source_marginal + (z - p0)
+    steps = 1
+    checks = 0
+    converged = False
+    floor = 8.0 * np.finfo(float).eps * (1.0 + abs(obj0))
+
+    while True:
+        tgt_j = float(z.sum())
+        d = column_gradient_f(problem, src, tgt_j, j) + shift
+        certificate = subproblem_certificate(
+            d + gamma * z, z, src - z, problem.source_kl_weight, gamma
+        )
+        checks += 1
+        decrease = obj0 - column_subproblem_objective(
+            problem, z, src, tgt_j, j, selected_v
+        )
+        eps_k = config.inner_rho * max(block_gap, decrease)
+        if certificate <= max(eps_k, floor):
+            converged = True
+            break
+        if steps >= max_inner:
+            break
+        # The gradient used by the certificate is reused for the next step.
+        L = columnwise_entropy_smoothness(problem, src, z, config)
+        candidate = entropy_bcdc_candidate(
+            z, d, L, gamma, config.min_plan_value, log_radius=config.block_log_radius
+        )
+        src = src + (candidate - z)
+        z = candidate
+        steps += 1
+
+    return z, src, steps, checks, converged
+
+
 def choose_block(
     problem,
     plan,
@@ -963,6 +1152,9 @@ def init_counters():
         "mean_step_size": 0.0,
         "acceptance_rate": 1.0,
         "number_backtracking_steps": 0,
+        "inner_solves": 0,
+        "inner_solves_unconverged": 0,
+        "certificate_checks": 0,
     }
 
 
@@ -1006,6 +1198,30 @@ def selected_subgradient_kkt_residual(
     return float(np.sqrt(squared))
 
 
+def gap_concentration(problem, plan, source_marginal, target_marginal, config, log_radius):
+    """Column gap contributions Delta_j at the current plan (each with the
+    column's own top-Q subgradient) and Gamma = n max_j Delta_j / sum_j Delta_j
+    of thm:existing-gap-gs (Gamma = 1 when the sum vanishes).  log_radius is the
+    trust radius used for the constant L_j; np.inf gives the global constant
+    tau_a + tau_b, i.e. the fixed Psi of the theory."""
+    diagnostic_config = replace(
+        config, selection_rule="bregman_gap", block_log_radius=log_radius
+    )
+    _, _, _, gaps, _ = evaluate_block_batch(
+        problem,
+        plan,
+        source_marginal,
+        target_marginal,
+        np.arange(problem.num_target),
+        diagnostic_config,
+        need_candidate=True,
+    )
+    total = float(np.sum(gaps))
+    largest = float(np.max(gaps))
+    gamma_k = problem.num_target * largest / total if total > 0.0 else 1.0
+    return total, largest, float(gamma_k)
+
+
 def make_history_row(
     problem,
     plan,
@@ -1035,7 +1251,7 @@ def make_history_row(
     matvec_pass_equivalent = (
         float(counters["touched_nonzeros"] / dense_nnz) if dense_nnz > 0 else np.nan
     )
-    return {
+    row = {
         "method": METHOD_LABELS[method_key],
         "method_key": method_key,
         "configured_outer_iterations": int(config.num_sweeps),
@@ -1065,7 +1281,19 @@ def make_history_row(
         "mean_step_size": float(counters["mean_step_size"]),
         "acceptance_rate": float(counters["acceptance_rate"]),
         "number_backtracking_steps": int(counters["number_backtracking_steps"]),
+        "inner_solves": int(counters["inner_solves"]),
+        "inner_solves_unconverged": int(counters["inner_solves_unconverged"]),
+        "certificate_checks": int(counters["certificate_checks"]),
     }
+    if config.log_gamma:
+        for name, radius in (("local", config.block_log_radius), ("global", np.inf)):
+            total, largest, gamma_k = gap_concentration(
+                problem, plan, source_marginal, target_marginal, config, radius
+            )
+            row[f"gap_sum_{name}"] = total
+            row[f"gap_max_{name}"] = largest
+            row[f"Gamma_{name}"] = gamma_k
+    return row
 
 
 def append_history_row(
@@ -1235,7 +1463,39 @@ def solve_bcdc(
         counters["column_accesses"] += int(selection_columns)
         counters["touched_nonzeros"] += int(selection_touched)
 
-        if use_inner_iterations:
+        if config.inner_stopping == "certificate":
+            step_max_inner = (
+                int(inner_iterations_schedule(iteration))
+                if inner_iterations_schedule is not None
+                else None
+            )
+            candidate, updated_source_marginal, inner_used, checks, subproblem_converged = (
+                solve_selected_coordinate_subproblem_certified(
+                    problem,
+                    plan,
+                    source_marginal,
+                    target_marginal,
+                    j,
+                    selected_v,
+                    config,
+                    precomputed_candidate=precomputed_candidate,
+                    max_inner=step_max_inner,
+                )
+            )
+            plan[:, j] = candidate
+            source_marginal = updated_source_marginal
+            target_marginal[j] = float(candidate.sum())
+            total_inner_cumulative += int(inner_used)
+            counters["inner_solves"] += 1
+            counters["inner_solves_unconverged"] += int(not subproblem_converged)
+            counters["certificate_checks"] += int(checks)
+            # Every certificate needs the column gradient; all but the last one
+            # are reused by the next step, but charge each check one column
+            # pass anyway.
+            counters["touched_nonzeros"] += int(problem.num_source * checks)
+            if inner_usage_log is not None:
+                inner_usage_log.append(int(inner_used))
+        elif use_inner_iterations:
             step_max_inner = (
                 int(inner_iterations_schedule(iteration))
                 if inner_iterations_schedule is not None
@@ -1358,6 +1618,10 @@ def solve_full_dca(problem, config, initial_plan=None, geometry="entropy"):
         subproblem_converged = False
         inner = 0
         mean_step_sum = 0.0
+        certified = config.inner_stopping == "certificate"
+        objective_start = previous_subproblem
+        floor = 8.0 * np.finfo(float).eps * (1.0 + abs(objective_start))
+        full_gap = 0.0
 
         for inner in range(1, int(config.max_inner_iterations) + 1):
             update_start = time.perf_counter()
@@ -1375,6 +1639,28 @@ def solve_full_dca(problem, config, initial_plan=None, geometry="entropy"):
                     problem, plan, source_marginal, target_marginal, v_anchor, config
                 )
                 mean_step = 1.0 / max(float(selected_score), EPS)
+
+            if certified and inner == 1:
+                # Gap of the full block at the outer iterate, from the first
+                # step (Delta_k in eps_k; recomputed here, charged with the step).
+                d0, g0 = full_selected_dc_terms_with_anchor(
+                    problem, plan, source_marginal, target_marginal, v_anchor
+                )
+                if geometry == "entropy":
+                    L = problem.entropy_relative_smoothness * config.relative_smoothness_scale
+                    full_gap = (
+                        float(np.sum(d0 * (plan - candidate)))
+                        + 0.5
+                        * problem.quadratic_weight
+                        * float(np.sum(plan * plan) - np.sum(candidate * candidate))
+                        - L * entropy_kl(candidate, plan)
+                    )
+                else:
+                    step = plan - candidate
+                    full_gap = float(np.sum(g0 * step)) - 0.5 * float(
+                        selected_score
+                    ) * float(np.sum(step * step))
+                full_gap = max(full_gap, 0.0)
 
             plan = candidate
             source_marginal = plan.sum(axis=1)
@@ -1395,11 +1681,32 @@ def solve_full_dca(problem, config, initial_plan=None, geometry="entropy"):
                 previous_subproblem, current_subproblem
             )
             previous_subproblem = current_subproblem
-            if subproblem_obj_change <= config.inner_tol:
+            if certified:
+                _, gradient = full_selected_dc_terms_with_anchor(
+                    problem, plan, source_marginal, target_marginal, v_anchor
+                )
+                certificate = subproblem_certificate(
+                    gradient,
+                    plan,
+                    np.zeros(problem.num_source),
+                    problem.source_kl_weight,
+                    problem.quadratic_weight,
+                )
+                counters["certificate_checks"] += 1
+                counters["touched_nonzeros"] += int(dense_nnz)
+                eps_k = config.inner_rho * max(
+                    full_gap, objective_start - current_subproblem
+                )
+                if certificate <= max(eps_k, floor):
+                    subproblem_converged = True
+                    break
+            elif subproblem_obj_change <= config.inner_tol:
                 subproblem_converged = True
                 break
 
         total_inner += int(inner)
+        counters["inner_solves"] += 1
+        counters["inner_solves_unconverged"] += int(not subproblem_converged)
 
         if outer % config.record_every_sweeps == 0 or outer == config.num_sweeps:
             t0 = append_history_row(
