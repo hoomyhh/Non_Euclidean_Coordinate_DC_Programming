@@ -19,10 +19,15 @@
 
 set -euo pipefail
 
-export OT_PROJECT="/nobackup/proj/disk/ulio_inverse/akarak/ot"
+export OT_PROJECT="${OT_PROJECT:-/nobackup/proj/disk/ulio_inverse/personal/akarak/ot}"
 export OT_FEATURE_CACHE="$OT_PROJECT/data/cifar10_resnet18_imagenet1k_v1_features.npz"
 export OT_OUTPUT_ROOT="$OT_PROJECT/outputs"
 export OT_TASK_FILE="$OT_PROJECT/tasks.txt"
+
+if [[ ! -f "$OT_FEATURE_CACHE" ]]; then
+    echo "Feature cache not found: $OT_FEATURE_CACHE" >&2
+    exit 2
+fi
 
 # One core per process; numpy must not spawn its own threads.
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1

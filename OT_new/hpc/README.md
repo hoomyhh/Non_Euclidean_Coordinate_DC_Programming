@@ -5,10 +5,10 @@ Each (configuration, seed, method) is an independent single-core run.
 GPU node (our allocation cannot use the cpu partition; the GPU stays idle) and
 then aggregates each configuration. Configurations are defined in `configs.sh`.
 
-One-time setup (paths as in `ot_node.slurm`):
+One-time setup (paths as in `ot_node.slurm`; override with `OT_PROJECT`):
 
 ```bash
-P=/nobackup/proj/disk/ulio_inverse/akarak/ot
+P=/nobackup/proj/disk/ulio_inverse/personal/akarak/ot
 mkdir -p $P/data $P/outputs
 # from the workstation: copy the feature cache (no torch or CIFAR needed then)
 rsync -av OT_new/data/cifar10_resnet18_imagenet1k_v1_features.npz arrhenius:$P/data/
