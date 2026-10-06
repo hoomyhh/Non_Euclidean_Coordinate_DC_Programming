@@ -1,6 +1,7 @@
 #!/bin/bash
 # Usage: make_tasks.sh TASK_FILE NUM_SEEDS CONFIG [CONFIG ...]
-# Writes one line "CONFIG SEED METHOD" per independent run.
+# Writes one line "CONFIG SEED METHOD" per independent run, slowest methods
+# first so that the long runs start immediately and short ones fill the gaps.
 
 set -euo pipefail
 if (( $# < 3 )); then
@@ -11,9 +12,9 @@ task_file="$1"; num_seeds="$2"; shift 2
 methods=(uniform bregman_gap lipschitz full_entropy full_euclidean)
 
 : > "$task_file"
-for config in "$@"; do
-    for ((seed = 0; seed < num_seeds; seed++)); do
-        for method in "${methods[@]}"; do
+for method in "${methods[@]}"; do
+    for config in "$@"; do
+        for ((seed = 0; seed < num_seeds; seed++)); do
             echo "$config $seed $method" >> "$task_file"
         done
     done
